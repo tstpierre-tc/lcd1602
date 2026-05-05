@@ -26,6 +26,7 @@ const (
 	CMD_Display_Control      = 0x08
 	CMD_Cursor_Display_Shift = 0x10
 	CMD_Function_Set         = 0x20
+	CMD_CGRAM_Set            = 0x40
 	CMD_DDRAM_Set            = 0x80
 
 	// Options
@@ -59,7 +60,9 @@ type Dev struct {
 	displayShift    bool
 	shiftRight      bool
 	c               mmr.Dev8
-	opts            Opts
+	Opts            Opts
+	nextCustomIndex uint8
+	CharMap         map[string]uint8
 }
 
 func (d *Dev) String() string {
@@ -86,7 +89,6 @@ func NewI2C(b i2c.Bus, opts *Opts) (*Dev, error) {
 
 // Halt is a noop for the cap1xxx.
 func (d *Dev) Halt() error {
-	// TODO blank the screen and turn off the backlight
 	d.Clear()
 	d.SetBacklight(false)
 	return nil
@@ -106,11 +108,11 @@ func (d *Dev) Home() {
 }
 
 func (d *Dev) SetPosition(line, pos byte) error {
-	if line > d.opts.Lines {
-		return fmt.Errorf("lcd1602 %x: device does not support %d lines", line, d.opts.I2CAddr)
+	if line > d.Opts.Lines {
+		return fmt.Errorf("lcd1602 %x: device does not support %d lines", line, d.Opts.I2CAddr)
 	}
-	if pos > d.opts.Cols {
-		return fmt.Errorf("lcd1602 %x: device does not support %d cols", line, d.opts.I2CAddr)
+	if pos > d.Opts.Cols {
+		return fmt.Errorf("lcd1602 %x: device does not support %d cols", line, d.Opts.I2CAddr)
 	}
 	var address byte
 	switch line {
@@ -130,8 +132,9 @@ func (d *Dev) SetPosition(line, pos byte) error {
 func (d *Dev) Write(buf []byte) (int, error) {
 	for _, c := range buf {
 		d.write(c, false)
-		time.Sleep(d.opts.CharDelay)
+		time.Sleep(d.Opts.CharDelay)
 	}
+	log.Printf("%s %d", buf, buf)
 	return len(buf), nil
 }
 
@@ -142,7 +145,34 @@ func (d *Dev) WriteChar(char byte) error {
 }
 
 func (d *Dev) Right() byte {
-	return d.opts.Cols
+	return d.Opts.Cols
+}
+
+func (d *Dev) SetCustomChar(name string, data []byte) error {
+	if d.nextCustomIndex >= 7 {
+		return fmt.Errorf("lcd1602 %x: No more custome character space! ", d.Opts.I2CAddr)
+	}
+	if len(data) != 8 {
+		return fmt.Errorf("lcd1602 %x: Custom character must be 8 bytes! ", d.Opts.I2CAddr)
+	}
+	address := CMD_CGRAM_Set | (d.nextCustomIndex * 8)
+	log.Infof("Writing to address %b - %x", address, address)
+	d.write(address, true)
+	for _, v := range data {
+		d.write(v, false)
+	}
+	d.CharMap[name] = d.nextCustomIndex
+	d.nextCustomIndex++
+	return nil
+}
+
+func (d *Dev) CustomChar(name string) error {
+	addr, hasChar := d.CharMap[name]
+	if !hasChar {
+		return fmt.Errorf("lcd1602 %x: Custom character %s not set! ", d.Opts.I2CAddr, name)
+	}
+	d.write(addr, false)
+	return nil
 }
 
 func makeDev(c conn.Conn, isSPI bool, opts *Opts) (*Dev, error) {
@@ -152,9 +182,10 @@ func makeDev(c conn.Conn, isSPI bool, opts *Opts) (*Dev, error) {
 		blink:         true,
 		displayShift:  false,
 		shiftRight:    false,
-		opts:          *opts,
+		Opts:          *opts,
 		isSPI:         isSPI,
 		c:             mmr.Dev8{Conn: c, Order: binary.LittleEndian},
+		CharMap:       make(map[string]uint8),
 	}
 
 	// Activate LCD
@@ -202,7 +233,7 @@ func (d *Dev) writeDisplaySwitch() {
 	if d.blink {
 		option = option | OPT_Enable_Blink
 	}
-	log.Info("Writing display switch")
+	log.Debug("Writing display switch")
 	d.command(option)
 }
 
@@ -215,12 +246,22 @@ func (d *Dev) DisplayShift(right bool) {
 }
 
 func (d *Dev) CursorShift(right bool) {
-	log.Info("Writing cursor shift")
+	log.Debug("Writing cursor shift")
 	option := byte(CMD_Cursor_Display_Shift)
 	if right {
 		option = option | OPT_Shift_Right
 	}
 	d.command(option)
+}
+
+func (d *Dev) CursorOn(on bool) {
+	d.cursor = on
+	d.writeDisplaySwitch()
+}
+
+func (d *Dev) SetBlink(on bool) {
+	d.blink = on
+	d.writeDisplaySwitch()
 }
 
 func (d *Dev) writeEntryMode() {
@@ -236,13 +277,15 @@ func (d *Dev) writeEntryMode() {
 
 func (d *Dev) command(data byte) {
 	d.write(data, true)
+	time.Sleep(100 * time.Microsecond)
 }
+
 func (d *Dev) WriteCell(char byte) {
 	d.write(0x40|char, false)
 }
 func (d *Dev) write(data byte, command bool) {
 	var i2c_data byte
-	log.Infof("Writing %b %x", data, data)
+	log.Debugf("Writing %b %x", data, data)
 	// Add data for high nibble
 	hi_nibble := data >> 4
 	i2c_data = pinInterpret(D4, i2c_data, (hi_nibble&0x01 == 0x01))
